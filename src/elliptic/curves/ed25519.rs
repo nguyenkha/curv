@@ -14,8 +14,7 @@ pub const TWO_TIMES_SECRET_KEY_SIZE: usize = 64;
 use super::traits::{ECPoint, ECScalar};
 use crate::cryptographic_primitives::hashing::hash_sha256::HSha256;
 use crate::cryptographic_primitives::hashing::traits::Hash;
-use serde::de::{self, Error, MapAccess, SeqAccess, Visitor};
-use serde::ser::SerializeStruct;
+use serde::de::{self, Visitor};
 use serde::ser::{Serialize, Serializer};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
@@ -491,9 +490,7 @@ impl Serialize for Ed25519Point {
         let bytes = self.pk_to_key_slice();
         let bytes_as_bn = BigInt::from_bytes(&bytes[..]);
         let padded_bytes_hex = format!("{:0>64}", bytes_as_bn.to_hex());
-        let mut state = serializer.serialize_struct("ed25519CurvePoint", 1)?;
-        state.serialize_field("bytes_str", &padded_bytes_hex)?;
-        state.end()
+        serializer.serialize_str(&padded_bytes_hex)
     }
 }
 
@@ -502,8 +499,7 @@ impl<'de> Deserialize<'de> for Ed25519Point {
     where
         D: Deserializer<'de>,
     {
-        let fields = &["bytes_str"];
-        deserializer.deserialize_struct("Ed25519Point", fields, Ed25519PointVisitor)
+        deserializer.deserialize_str(Ed25519PointVisitor)
     }
 }
 
@@ -516,36 +512,14 @@ impl<'de> Visitor<'de> for Ed25519PointVisitor {
         formatter.write_str("Ed25519Point")
     }
 
-    fn visit_seq<V>(self, mut seq: V) -> Result<Ed25519Point, V::Error>
-    where
-        V: SeqAccess<'de>,
-    {
-        let bytes_str = seq
-            .next_element()?
-            .ok_or_else(|| V::Error::invalid_length(0, &"a single element"))?;
-        let bytes_bn = BigInt::from_hex(bytes_str).map_err(V::Error::custom)?;
+    fn visit_str<E: de::Error>(self, s: &str) -> Result<Ed25519Point, E> {
+        let bytes_bn = BigInt::from_hex(s).map_err(|_| E::custom("failed to parse ed25519 point"))?;
         let bytes = BigInt::to_bytes(&bytes_bn);
-        Ed25519Point::from_bytes(&bytes[..])
-            .map_err(|_| V::Error::custom("failed to parse ed25519 point"))
-    }
-
-    fn visit_map<E: MapAccess<'de>>(self, mut map: E) -> Result<Ed25519Point, E::Error> {
-        let mut bytes_str: String = "".to_string();
-
-        while let Some(key) = map.next_key::<&'de str>()? {
-            let v = map.next_value::<&'de str>()?;
-            match key {
-                "bytes_str" => {
-                    bytes_str = String::from(v);
-                }
-                _ => return Err(E::Error::unknown_field(key, &["bytes_str"])),
-            }
-        }
-
-        let bytes_bn = BigInt::from_hex(&bytes_str).map_err(E::Error::custom)?;
-        let bytes = BigInt::to_bytes(&bytes_bn);
-
-        Ed25519Point::from_bytes(&bytes[..]).map_err(|_| E::Error::custom("invalid ed25519 point"))
+        let p = Ed25519Point::from_bytes(&bytes[..]).map_err(|_| E::custom("failed to parse ed25519 point"))?;
+        // Revert mul 8
+        let eight: FE = ECScalar::from(&BigInt::from(8));
+        let eight_inverse = eight.invert();
+        Ok(p * eight_inverse)
     }
 }
 
@@ -613,20 +587,16 @@ mod tests {
         let mut pk = GE::generator();
         let mut s = serde_json::to_string(&pk).expect("Failed in serialization");
         let mut des_pk: GE = serde_json::from_str(&s).expect("Failed in deserialization");
-        let eight = ECScalar::from(&BigInt::from(8));
-        assert_eq!(des_pk, pk * &eight);
+        assert_eq!(des_pk, pk);
 
         pk = GE::base_point2();
         s = serde_json::to_string(&pk).expect("Failed in serialization");
         des_pk = serde_json::from_str(&s).expect("Failed in deserialization");
-        assert_eq!(des_pk, pk * &eight);
+        assert_eq!(des_pk, pk);
 
         // deserialize serialization of bytes_str < 64 hex
-        s = "{\"bytes_str\":\"2c42d43e1a277e8f3d7d5aacde519c80b913341e425b624d867f790d1578e0\"}"
-            .to_string();
-        des_pk = serde_json::from_str(&s).expect("Failed in deserialization");
-        let eight_inverse: FE = eight.invert();
-        let des_pk_mul = des_pk * &eight_inverse;
+        des_pk = serde_json::from_str("2c42d43e1a277e8f3d7d5aacde519c80b913341e425b624d867f790d1578e0").expect("Failed in deserialization");
+        let des_pk_mul = des_pk;
         assert_eq!(
             des_pk_mul.bytes_compressed_to_big_int().to_hex(),
             "2c42d43e1a277e8f3d7d5aacde519c80b913341e425b624d867f790d1578e0"
@@ -636,12 +606,12 @@ mod tests {
         let ser_pk = serde_json::to_string(&des_pk_mul).expect("Failed in serialization");
         assert_eq!(
             &ser_pk,
-            "{\"bytes_str\":\"002c42d43e1a277e8f3d7d5aacde519c80b913341e425b624d867f790d1578e0\"}"
+            "002c42d43e1a277e8f3d7d5aacde519c80b913341e425b624d867f790d1578e0"
         );
 
         // deserialize a padded serialization
         let des_pk2: GE = serde_json::from_str(&ser_pk).expect("Failed in deserialization");
-        assert_eq!(des_pk_mul, des_pk2 * &eight_inverse);
+        assert_eq!(des_pk_mul, des_pk2);
     }
 
     #[test]
@@ -650,8 +620,7 @@ mod tests {
         let pk = GE::generator();
         let encoded = bincode::serialize(&pk).unwrap();
         let decoded: Ed25519Point = bincode::deserialize(encoded.as_slice()).unwrap();
-        let eight = ECScalar::from(&BigInt::from(8));
-        assert_eq!(pk * &eight, decoded);
+        assert_eq!(pk, decoded);
     }
 
     #[test]
